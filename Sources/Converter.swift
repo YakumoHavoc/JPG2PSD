@@ -57,6 +57,11 @@ enum Converter {
     /// 同时解码/打包的字节上限，约 2GB
     private static let memoryBudget = 2_000_000_000
 
+    /// 读不出像素数时（文件损坏、不是受支持的图片）按「大图」估算的像素数。
+    /// 这类文件在解码阶段通常也会立刻失败、几乎不占内存，但绝不能按 0 计：
+    /// 按 0 会让任意大的文件都能挤进当前波，内存预算就形同失效。
+    private static let unknownPixelCount = 50_000_000
+
     /// 写盘串行队列（见 convertOne 的说明）
     private static let writeQueue = DispatchQueue(label: "com.tools.jpg2psd.write")
 
@@ -163,7 +168,10 @@ enum Converter {
             var wave: [Int] = []
             var waveCost = 0
             while cursor < total {
-                let cost = (ImageLoader.pixelCount(path: jobs[cursor].source) ?? 0) * bytesPerPixel
+                // 读不到像素数时按大图估算，避免「未知尺寸」的文件无成本地挤进当前波
+                let pixels = ImageLoader.pixelCount(path: jobs[cursor].source) ?? unknownPixelCount
+                let cost = pixels * bytesPerPixel
+                // 单个文件即便超出预算也单独成波处理（`!wave.isEmpty`），避免死循环
                 if !wave.isEmpty, waveCost + cost > memoryBudget { break }
                 wave.append(cursor)
                 waveCost += cost
