@@ -109,40 +109,39 @@ enum CLIRunner {
             }
         }
 
-        var succeeded = 0, skipped = 0, failed = 0
-        var totalBytes = 0
-
-        for (position, source) in files.enumerated() {
+        let jobs = files.map { source -> ConvertJob in
             let name = (source as NSString).lastPathComponent
             let stem = (name as NSString).deletingPathExtension
             let directory = outputDirectory ?? (source as NSString).deletingLastPathComponent
-            let destination = (directory as NSString).appendingPathComponent(stem + ".psd")
-            let prefix = "[\(position + 1)/\(files.count)] \(name)"
+            return ConvertJob(source: source,
+                              destination: (directory as NSString).appendingPathComponent(stem + ".psd"),
+                              name: name, stem: stem)
+        }
 
-            do {
-                switch try Converter.convertOne(src: source, dst: destination,
-                                                compression: compression,
-                                                keepOrientation: keepOrientation,
-                                                overwrite: overwrite) {
-                case .ok(let description):
-                    succeeded += 1
-                    if let size = try? FileManager.default.attributesOfItem(atPath: destination)[.size] as? Int {
-                        totalBytes += size
-                    }
-                    if !quiet { print("\(prefix)  ->  \(stem).psd   \(description)") }
-                case .skipped(let reason):
-                    skipped += 1
-                    if !quiet { print("\(prefix)  跳过：\(reason)") }
-                }
-            } catch {
-                failed += 1
-                warn("\(prefix)  失败：\(error.localizedDescription)")
+        let total = jobs.count
+        let summary = Converter.runBatch(jobs,
+                                         compression: compression,
+                                         keepOrientation: keepOrientation,
+                                         overwrite: overwrite,
+                                         isCancelled: { false }) { index, result in
+            let job = jobs[index]
+            let prefix = "[\(index + 1)/\(total)] \(job.name)"
+            switch result {
+            case .ok(let description, _):
+                if !quiet { print("\(prefix)  ->  \(job.stem).psd   \(description)") }
+            case .skipped(let reason):
+                if !quiet { print("\(prefix)  跳过：\(reason)") }
+            case .failed(let message):
+                warn("\(prefix)  失败：\(message)")
+            case .cancelled:
+                break
             }
         }
 
         print(String(format: "\n完成：成功 %d，跳过 %d，失败 %d，共 %.1fMB。",
-                     succeeded, skipped, failed, Double(totalBytes) / 1_048_576))
-        return failed == 0 ? 0 : 1
+                     summary.succeeded, summary.skipped, summary.failed,
+                     Double(summary.totalBytes) / 1_048_576))
+        return summary.failed == 0 ? 0 : 1
     }
 
     // MARK: - 自检：导出解码后的平面像素

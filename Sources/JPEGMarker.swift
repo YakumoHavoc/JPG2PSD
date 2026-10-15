@@ -75,7 +75,7 @@ enum JPEGMarker {
             case 0xE1 where !exifPresent:
                 if body.count >= 6, hasPrefix(body, Array("Exif\0\0".utf8)) {
                     exifPresent = true
-                    exifDPI = exifDPI(fromTIFF: body, at: 6)
+                    exifDPI = exifResolution(fromTIFF: body, at: 6)
                 }
 
             case 0xE2:
@@ -121,7 +121,7 @@ enum JPEGMarker {
 
     /// 从 APP1 载荷里的 TIFF 头读 IFD0 的 XResolution(0x011A) 与 ResolutionUnit(0x0128)。
     /// 两者缺一即返回 nil（调用方按 Pillow 的规则回退 72 DPI）。
-    private static func exifDPI(fromTIFF payload: UnsafeBufferPointer<UInt8>, at tiff: Int) -> (Double, Double)? {
+    private static func exifResolution(fromTIFF payload: UnsafeBufferPointer<UInt8>, at tiff: Int) -> (Double, Double)? {
         guard payload.count >= tiff + 8 else { return nil }
         let marker = payload[tiff]
         let little: Bool

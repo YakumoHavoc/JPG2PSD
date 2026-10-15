@@ -32,7 +32,6 @@ final class MainWindowController: NSWindowController {
 
     // 状态
     private var sources: [String] = []
-    private var worker: DispatchQueue?
     private var cancelFlag: CancellationFlag?
     private var isRunning = false
     private var lastOutputDir: String?
@@ -526,7 +525,7 @@ final class MainWindowController: NSWindowController {
             }
         }
 
-        appendLog("开始转换 \(files.count) 个文件（压缩方式：\(compression.label)）。")
+        appendLog("开始转换 \(files.count) 个文件（压缩方式：\(compression.label)，并发 \(Converter.maxConcurrentFiles)）。")
         setRunning(true)
         progressBar.maxValue = Double(files.count)
         progressBar.doubleValue = 0
@@ -534,62 +533,57 @@ final class MainWindowController: NSWindowController {
 
         let flag = CancellationFlag()
         cancelFlag = flag
-        let queue = DispatchQueue(label: "com.tools.jpg2psd.convert", qos: .userInitiated)
-        worker = queue
 
-        queue.async { [weak self] in
-            var succeeded = 0, skipped = 0, failed = 0
-            var totalBytes = 0
-            var outputDir: String?
+        let jobs = files.map { source -> ConvertJob in
+            let name = (source as NSString).lastPathComponent
+            let stem = (name as NSString).deletingPathExtension
+            let directory = outputDirectory ?? (source as NSString).deletingLastPathComponent
+            return ConvertJob(source: source,
+                              destination: (directory as NSString).appendingPathComponent(stem + ".psd"),
+                              name: name, stem: stem)
+        }
+        let total = jobs.count
 
-            for (position, source) in files.enumerated() {
-                if flag.isCancelled { break }
-
-                let name = (source as NSString).lastPathComponent
-                let stem = (name as NSString).deletingPathExtension
-                let directory = outputDirectory ?? (source as NSString).deletingLastPathComponent
-                let destination = (directory as NSString).appendingPathComponent(stem + ".psd")
-                outputDir = directory
-                let prefix = "[\(position + 1)/\(files.count)] \(name)"
-
-                do {
-                    switch try Converter.convertOne(src: source, dst: destination,
-                                                    compression: compression,
-                                                    keepOrientation: keepOrientation,
-                                                    overwrite: overwrite) {
-                    case .ok(let description):
-                        succeeded += 1
-                        if let size = try? FileManager.default
-                            .attributesOfItem(atPath: destination)[.size] as? Int {
-                            totalBytes += size
-                        }
-                        self?.onMain { self?.appendLog("\(prefix)  ->  \(stem).psd   \(description)") }
-                    case .skipped(let reason):
-                        skipped += 1
-                        self?.onMain { self?.appendLog("\(prefix)  跳过：\(reason)") }
-                    }
-                } catch {
-                    failed += 1
-                    self?.onMain { self?.appendLog("\(prefix)  失败：\(error.localizedDescription)") }
-                }
-
-                let done = position + 1
+        // 转换按文件并行（见 Converter.runBatch），结果按顺序回到主线程刷新界面
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            // completed 只在主线程里读写
+            var completed = 0
+            let summary = Converter.runBatch(jobs,
+                                             compression: compression,
+                                             keepOrientation: keepOrientation,
+                                             overwrite: overwrite,
+                                             isCancelled: { flag.isCancelled }) { index, result in
+                let job = jobs[index]
                 self?.onMain {
-                    self?.progressBar.doubleValue = Double(done)
-                    self?.setStatus("转换中… \(done)/\(files.count)")
+                    let prefix = "[\(index + 1)/\(total)] \(job.name)"
+                    switch result {
+                    case .ok(let description, _):
+                        self?.appendLog("\(prefix)  ->  \(job.stem).psd   \(description)")
+                    case .skipped(let reason):
+                        self?.appendLog("\(prefix)  跳过：\(reason)")
+                    case .failed(let message):
+                        self?.appendLog("\(prefix)  失败：\(message)")
+                    case .cancelled:
+                        return
+                    }
+                    completed += 1
+                    self?.progressBar.doubleValue = Double(completed)
+                    self?.setStatus("转换中… \(completed)/\(total)")
                 }
             }
 
-            let cancelled = flag.isCancelled
             self?.onMain {
-                let megabytes = Double(totalBytes) / 1_048_576
-                let summary = String(format: "完成：成功 %d，跳过 %d，失败 %d，共 %.1fMB。",
-                                     succeeded, skipped, failed, megabytes)
-                self?.appendLog(cancelled ? "已停止。" + summary : summary)
+                let cancelled = flag.isCancelled
+                let megabytes = Double(summary.totalBytes) / 1_048_576
+                let text = String(format: "完成：成功 %d，跳过 %d，失败 %d，共 %.1fMB。",
+                                  summary.succeeded, summary.skipped, summary.failed, megabytes)
+                self?.appendLog(cancelled ? "已停止。" + text : text)
                 self?.setStatus(cancelled
-                    ? "已停止（成功 \(succeeded)，跳过 \(skipped)，失败 \(failed)）"
-                    : "完成：成功 \(succeeded)，跳过 \(skipped)，失败 \(failed)")
-                if succeeded > 0, let directory = outputDir {
+                    ? "已停止（成功 \(summary.succeeded)，跳过 \(summary.skipped)，失败 \(summary.failed)）"
+                    : "完成：成功 \(summary.succeeded)，跳过 \(summary.skipped)，失败 \(summary.failed)")
+                if summary.succeeded > 0,
+                   let directory = outputDirectory
+                       ?? jobs.last.map({ ($0.source as NSString).deletingLastPathComponent }) {
                     self?.lastOutputDir = directory
                     self?.openOutputButton.isEnabled = true
                 }
@@ -615,7 +609,6 @@ final class MainWindowController: NSWindowController {
         progressBar.isHidden = false
         if !running {
             cancelFlag = nil
-            worker = nil
         }
     }
 }

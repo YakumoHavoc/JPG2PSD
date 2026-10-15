@@ -39,6 +39,16 @@ struct LoadedImage {
 }
 
 enum ImageLoader {
+    /// 只解析图像头取得像素总数（不解码像素），用于批量转换时的内存配额估算。
+    static func pixelCount(path: String) -> Int? {
+        let url = URL(fileURLWithPath: path) as CFURL
+        guard let source = CGImageSourceCreateWithURL(url, nil),
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let width = properties[kCGImagePropertyPixelWidth] as? Int,
+              let height = properties[kCGImagePropertyPixelHeight] as? Int else { return nil }
+        return width * height
+    }
+
     /// 解码单个文件。`keepOrientation = true` 时不做 EXIF 摆正。
     static func load(path: String, keepOrientation: Bool) throws -> LoadedImage {
         guard let source = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil) else {

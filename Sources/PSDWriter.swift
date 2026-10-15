@@ -70,46 +70,40 @@ enum PSDWriter {
 
     // MARK: - PackBits
 
-    /// 对单行像素做 PackBits(RLE) 编码，按 128 字节分块，结果一定能被正确解码。
+    /// 把单行像素按 PackBits(RLE) 编码后**追加**到 `buffer`，按 128 字节分块，
+    /// 结果一定能被正确解码。复用同一个缓冲区可以避免每行都新建临时数组。
     ///
     /// 规则：整块 128 字节完全相同 -> 压缩指令（2 字节）；否则 -> 原样输出该块。
     /// 末尾不足 128 字节的块用哨兵值填充，避免与真实数据被误判为同一个 run。
-    static func packBits(_ row: UnsafeBufferPointer<UInt8>) -> [UInt8] {
+    static func packBits(_ row: UnsafeBufferPointer<UInt8>, into buffer: inout [UInt8]) {
         let n = row.count
-        if n == 0 { return [] }
+        if n == 0 { return }
 
         let blockCount = (n + 127) / 128
-        let pad = blockCount * 128 - n
-        var buf = [UInt8](repeating: 0, count: blockCount * 128)
-        for i in 0..<n { buf[i] = row[i] }
-        if pad > 0 {
-            let last = row[n - 1]
-            let sentinel: UInt8 = last != 255 ? last + 1 : last - 1
-            for i in n..<buf.count { buf[i] = sentinel }
-        }
+        let last = row[n - 1]
+        let sentinel: UInt8 = last != 255 ? last + 1 : last - 1
 
-        var out = [UInt8]()
-        out.reserveCapacity(n / 2 + blockCount * 2)
         for b in 0..<blockCount {
             let base = b * 128
-            let length = (b != blockCount - 1 || pad == 0) ? 128 : 128 - pad
-            let first = buf[base]
+            let length = Swift.min(128, n - base)
+            let first = row[base]
             var constant = true
             var i = 1
             while i < 128 {
-                if buf[base + i] != first { constant = false; break }
+                // 末块超出真实数据的部分即哨兵值
+                let value = base + i < n ? row[base + i] : sentinel
+                if value != first { constant = false; break }
                 i += 1
             }
             if constant && length >= 3 {
                 // 有符号 -(length-1)
-                out.append(UInt8(truncatingIfNeeded: 256 - (length - 1)))
-                out.append(first)
+                buffer.append(UInt8(truncatingIfNeeded: 256 - (length - 1)))
+                buffer.append(first)
             } else {
-                out.append(UInt8(length - 1))
-                out.append(contentsOf: buf[base..<(base + length)])
+                buffer.append(UInt8(length - 1))
+                buffer.append(contentsOf: UnsafeBufferPointer(rebasing: row[base..<(base + length)]))
             }
         }
-        return out
     }
 
     // MARK: - 图像资源块
@@ -162,24 +156,31 @@ enum PSDWriter {
         let width = image.width
         let height = image.height
         let planeSize = image.planeSize
+        let rowCount = channels * height
 
         var rowLengths: [Int] = []
-        var rleBody = Data()
+        var rleBody = [UInt8]()
         var maxRowLength = 0
 
         if compression != .raw {
+            // auto 只需要判断「RLE 是否比 Raw 更小」：一旦超出 Raw 体积就没必要继续编码
+            let abortWhenLarger = compression == .auto
             image.data.withUnsafeBytes { rawBuffer in
                 let pixels = rawBuffer.bindMemory(to: UInt8.self)
-                rowLengths.reserveCapacity(channels * height)
-                rleBody.reserveCapacity(image.data.count)
-                for c in 0..<channels {
+                rowLengths.reserveCapacity(rowCount)
+                // 最坏情况（全部无法压缩）：每行多 1 字节的指令头
+                rleBody.reserveCapacity(image.data.count + rowCount)
+                rows: for c in 0..<channels {
                     let planeStart = c * planeSize
                     for y in 0..<height {
                         let start = planeStart + y * width
-                        let encoded = packBits(UnsafeBufferPointer(rebasing: pixels[start..<(start + width)]))
-                        rowLengths.append(encoded.count)
-                        if encoded.count > maxRowLength { maxRowLength = encoded.count }
-                        rleBody.append(contentsOf: encoded)
+                        let before = rleBody.count
+                        packBits(UnsafeBufferPointer(rebasing: pixels[start..<(start + width)]),
+                                 into: &rleBody)
+                        let encoded = rleBody.count - before
+                        rowLengths.append(encoded)
+                        if encoded > maxRowLength { maxRowLength = encoded }
+                        if abortWhenLarger, rleBody.count >= image.data.count { break rows }
                     }
                 }
             }
@@ -188,6 +189,7 @@ enum PSDWriter {
         var useRLE = compression == .rle
         if compression == .auto {
             // 行长度超出 2 字节表上限时无法用 RLE；否则取体积更小者
+            // （编码提前终止时 rleBody 必然已不小于 Raw，同样落到 Raw）
             useRLE = maxRowLength <= maxRowLengthLimit && rleBody.count < image.data.count
         }
         if compression == .rle, maxRowLength > maxRowLengthLimit {
@@ -224,7 +226,7 @@ enum PSDWriter {
         if useRLE {
             out.appendBE16(compressionRLE)
             for length in rowLengths { out.appendBE16(UInt16(length)) }
-            out.append(rleBody)
+            out.append(contentsOf: rleBody)
             return (out, "RLE(无损)")
         } else {
             out.appendBE16(compressionRaw)
